@@ -1,0 +1,1041 @@
+// Politecnico di Milano – Geoinformatics Project A.Y. 2022-2023
+// Author: Daniel Alberto Aguirre Nieto
+// February 2024
+// For documentation refer to https://github.com/Daenel35/Geoinformatics_GEE.git
+
+// Script for Historic USGS Landsat Mission Data exploration for a given AOI
+// Use case for the Protected Area of the Paramo de Guerrero, Central Colombia
+// Notes on AOI Size, must have less than 10 million pixels, at a 30 m resolution that is an
+// area of 94.5 Km by 94.5 Km, moreless 8930 Km2
+// ***Insert your AOI here or Use the Imported one
+print('AOI:', AOI);
+var AOI_size_Km2 =  AOI.geometry().area({'maxError': 1}).divide(1000000).round();
+print('Area of Interest Size in [Km2]', AOI_size_Km2);
+
+// ---------------------------*** USER Specified Parameters ***------------------------------//
+var max_CloudCover = 40; // Starting maximum cloud cover for first filter of scenes
+var Date_from = '1972-07-01'; // Start date
+var Date_to = '2024-02-01'; // End date
+// Reflectance threshold (0.01-0.99) under which a pixel is valid for L2 MSS Collection
+var L2_CT = [0.20,0.20,0.20,0.20]; // [B4,B5,B6,B7] or [green,red,nir1,nir2]
+// Number of pixels to buffer in circle around cloud pixels
+var L2_Px_buffer = 4; // [px]
+// Average distance in meters in which to cast shadows from the clouds
+var L2_Shadow_dist = 360; // [m]
+// Minimum valid (No Cloud) pixel Area percentage on AOI
+var min_validA_L2 = 40; //[%]
+// Reflectance threshold (0.01-0.99) under which a pixel is valid for L4 MSS Collection
+var L4_CT = [0.18,0.18,0.18,0.18]; // [B1,B2,B3,B4] or [green,red,nir1,nir2]
+// Number of pixels to buffer in circle around cloud pixels
+var L4_Px_buffer = 3; // [px]
+// Average distance in meters in which to cast shadows from the clouds
+var L4_Shadow_dist = 360; // [m]
+// Minimum valid (No Cloud) pixel Area percentage on AOI
+var min_validA_L4 = 40; //[%]
+// Reflectance threshold (0.01-0.99) under which a pixel is valid for L5 MSS Collection
+var L5_CT = [0.18,0.18,0.18,0.18]; // [B1,B2,B3,B4] or [green,red,nir1,nir2]
+// Number of pixels to buffer in circle around cloud pixels
+var L5_Px_buffer = 3; // [px]
+// Average distance in meters in which to cast shadows from the clouds
+var L5_Shadow_dist = 300; // [m]
+// Minimum valid (No Cloud) pixel Area percentage on AOI
+var min_validA_L5 = 30; //[%]
+
+print('LANDSAT 2-9 Collections for AOI with less than ',max_CloudCover+
+      '% of CLOUD_COVER_LAND','between the dates '+Date_from+' and '+Date_to);
+Map.centerObject(AOI, 10); //Image Centered in AOI
+
+// ----------------------------------  Script Functions --------------------------------------//
+// Landsat Missions Functions
+// Applies scaling factors for Level 2 Data on Landsat 4, 5 and 7.
+function applyScaleFactors(image) {
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2).float();
+  var thermalBand = image.select('ST_B6').multiply(0.00341802).add(149.0).float();
+  return image.addBands(opticalBands, null, true)
+              .addBands(thermalBand, null, true);
+}
+
+// Applies scaling factors for Level 2 Data on Landsat 8 and 9.
+function applyScaleFactors_new(image) {
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+  return image.addBands(opticalBands, null, true)
+              .addBands(thermalBands, null, true);
+}
+
+// Custom function to obtain TOA Reflectance with Metadata for Landsat 2 MSS
+function TOA_from_Metada_L2(image) {
+  var bandsToProcess = ['B4', 'B5', 'B6', 'B7'];
+  var B4 = image.select('B4').multiply(image.getNumber('REFLECTANCE_MULT_BAND_4'))
+                             .add(image.getNumber('REFLECTANCE_ADD_BAND_4')).toDouble();
+  var B5 = image.select('B5').multiply(image.getNumber('REFLECTANCE_MULT_BAND_5'))
+                             .add(image.getNumber('REFLECTANCE_ADD_BAND_5')).toDouble();
+  var B6 = image.select('B6').multiply(image.getNumber('REFLECTANCE_MULT_BAND_6'))
+                             .add(image.getNumber('REFLECTANCE_ADD_BAND_6')).toDouble();
+  var B7 = image.select('B7').multiply(image.getNumber('REFLECTANCE_MULT_BAND_7'))
+                             .add(image.getNumber('REFLECTANCE_ADD_BAND_7')).toDouble();
+  return image.addBands(B4, null, true).addBands(B5, null, true)
+              .addBands(B6, null, true).addBands(B7, null, true);
+}
+
+// Custom Cloud Masking function by tresholding, buffering mask pixels and translating 
+// the buffer to mask shadows for Landsat 2 MSS
+// Inputs: Image to process, Output: Cloud Mask 
+// threshold: Reflectance threshold (0.01-0.99..float) under which a pixel is valid, 
+// Px_buffer: (0-99..integer) number of pixels to buffer in circle around cloud pixels
+// Shadow_dist: Average distance in meters in which to cast shadows from the clouds
+function Cloud_Mask_MSS_L2(image, t4, t5, t6, t7, Px_buffer, Shadow_dist) {
+  var cloudMask = image.select('B4').lt(ee.Number(t4))
+                  .or(image.select('B5').lt(ee.Number(t5)))
+                  .or(image.select('B6').lt(ee.Number(t6)))
+                  .or(image.select('B7').lt(ee.Number(t7)));
+  var bufferedMask = cloudMask.focal_min(Px_buffer);
+  var shadowAzimuth = ee.Number(90).subtract(ee.Number(image.get('SUN_AZIMUTH')));
+  // Convert shadow azimuth to radians
+  var shadowAzimuthRadians = shadowAzimuth.multiply(Math.PI).divide(180);
+  // Calculate offsets along x and y directions for shadow buffer
+  // x coordinate increases east
+  var x_Shadow = shadowAzimuthRadians.cos().multiply(Shadow_dist).multiply(-1);
+  // y coordinate increases south
+  var y_Shadow = shadowAzimuthRadians.sin().multiply(Shadow_dist);
+  // Translate the cloud-buffered mask along the shadow direction
+  var shadowBufferedMask = ee.Image(bufferedMask).translate(x_Shadow, y_Shadow);
+  // Combine the buffered and shadow mask
+  var Full_Mask = bufferedMask.updateMask(shadowBufferedMask);
+  return Full_Mask;
+}
+
+// Cloud Masking for Landsat 2 MSS
+function Get_Cloud_Mask_MSS_L2(image) {
+  var Mask = Cloud_Mask_MSS_L2(image, L2_CT[0], L2_CT[1], L2_CT[2], L2_CT[3], 
+                                L2_Px_buffer, L2_Shadow_dist);
+  return Mask;
+}
+
+// Custom function to obtain TOA Reflectance with Metadata for Landsat 4 and 5 MSS
+function TOA_from_Metada_L4_L5(image) {
+  var bandsToProcess = ['B1', 'B2', 'B3', 'B4'];
+  var B1 = image.select('B1').multiply(image.getNumber('REFLECTANCE_MULT_BAND_1'))
+                             .add(image.getNumber('REFLECTANCE_ADD_BAND_1')).toDouble();
+  var B2 = image.select('B2').multiply(image.getNumber('REFLECTANCE_MULT_BAND_2'))
+                             .add(image.getNumber('REFLECTANCE_ADD_BAND_2')).toDouble();
+  var B3 = image.select('B3').multiply(image.getNumber('REFLECTANCE_MULT_BAND_3'))
+                             .add(image.getNumber('REFLECTANCE_ADD_BAND_3')).toDouble();
+  var B4 = image.select('B4').multiply(image.getNumber('REFLECTANCE_MULT_BAND_4'))
+                            .add(image.getNumber('REFLECTANCE_ADD_BAND_4')).toDouble();
+  return image.addBands(B1, null, true).addBands(B2, null, true)
+              .addBands(B3, null, true).addBands(B4, null, true);
+}
+// Custom Cloud Masking function by tresholding, buffering mask pixels and translating
+// the buffer to mask shadows for Landsat 4 and 5 MSS
+// Inputs: Image to process, Output: Cloud Mask 
+// threshold: Reflectance threshold (0.01-0.99..float) under which a pixel is valid, 
+// Px_buffer: (0-99..integer) number of pixels to buffer in circle around cloud pixels
+// Shadow_dist: Average distance in meters in which to cast shadows from the clouds
+function Cloud_Mask_MSS_L4_L5(image, t1, t2, t3, t4, Px_buffer, Shadow_dist) {
+  var cloudMask = image.select('B1').lt(ee.Number(t1))
+                  .or(image.select('B2').lt(ee.Number(t2)))
+                  .or(image.select('B3').lt(ee.Number(t3)))
+                  .or(image.select('B4').lt(ee.Number(t4)));
+  var bufferedMask = cloudMask.focal_min(Px_buffer);
+  var shadowAzimuth = ee.Number(90).subtract(ee.Number(image.get('SUN_AZIMUTH')));
+  // Convert shadow azimuth to radians
+  var shadowAzimuthRadians = shadowAzimuth.multiply(Math.PI).divide(180);
+  // Calculate offsets along x and y directions for shadow buffer
+  // x coordinate increases east
+  var x_Shadow = shadowAzimuthRadians.cos().multiply(Shadow_dist).multiply(-1);
+  // y coordinate increases south
+  var y_Shadow = shadowAzimuthRadians.sin().multiply(Shadow_dist); 
+  // Translate the cloud-buffered mask along the shadow direction
+  var shadowBufferedMask = ee.Image(bufferedMask).translate(x_Shadow, y_Shadow);
+  // Combine the buffered and shadow mask
+  var Full_Mask = bufferedMask.updateMask(shadowBufferedMask);
+  return Full_Mask;
+}
+
+// Cloud Masking for Landsat 4 MSS
+function Get_Cloud_Mask_MSS_L4(image) {
+  var Mask = Cloud_Mask_MSS_L4_L5(image, L4_CT[0], L4_CT[1], L4_CT[2], L4_CT[3], 
+                                L4_Px_buffer, L4_Shadow_dist);
+  return Mask;
+}
+// Cloud Masking for Landsat 5 MSS
+function Get_Cloud_Mask_MSS_L5(image) {
+  var Mask = Cloud_Mask_MSS_L4_L5(image, L5_CT[0], L5_CT[1], L5_CT[2], L5_CT[3], 
+                                L5_Px_buffer, L5_Shadow_dist);
+  return Mask;
+}
+
+// Cloud Masking Function based on the PIXEL_QA bitmask for Landsat
+// TM (L4,L5), ETM+ (L7), and OLI-TIRS (L8,L9)
+// As defined  Bit 1: Dilated Cloud, Bit 3: Cloud, Bit 4: Cloud Shadow  
+function Get_Cloud_Mask_QA(image) {
+  var Q_Band = image.select('QA_PIXEL');
+  // Create a binary mask where cloudy pixels (Bit 1, 3 and 4) are set to 1
+  var CloudMask = Q_Band.bitwiseAnd(1 << 1).neq(0)
+    .or(Q_Band.bitwiseAnd(1 << 3).neq(0))
+    .or(Q_Band.bitwiseAnd(1 << 4).neq(0));
+  return CloudMask;
+}
+
+
+// Valid pixel area calculation for all MSS Landsat Missions
+function Get_Valid_px_Area_MSS(image, mask) {
+  // Add a band to calculate area of valid pixels in the masked image
+  var area = ee.Image.pixelArea();
+  var ValidArea = mask.multiply(area).rename('VALID_AREA');
+  image = image.addBands(ValidArea);
+  var stats = image.select('VALID_AREA').reduceRegion({
+    reducer: ee.Reducer.sum(), 
+    geometry: AOI.geometry(), 
+    scale: 60,
+  });
+  return image.set(stats);
+}
+
+// Valid pixel area calculation for all TM ETM+ and OLI-TIRS Landsat Missions
+function Get_Valid_px_Area(image, mask) {
+  // Add a band to calculate area of valid pixels in the masked image
+  var area = ee.Image.pixelArea();
+  var ValidArea = mask.multiply(area).rename('VALID_AREA');
+  image = image.addBands(ValidArea);
+  var stats = image.select('VALID_AREA').reduceRegion({
+    reducer: ee.Reducer.sum(), 
+    geometry: AOI.geometry(), 
+    scale: 30,
+  });
+  return image.set(stats);
+}
+
+// Valid pixel area percentage calculation for all Landsat Missions
+function Get_Valid_px_Area_Perc(image) {
+  var area_Km = image.getNumber('VALID_AREA').toDouble().divide(1000000);
+  var area_perc = area_Km.divide(AOI_size_Km2).multiply(100);
+  var dict = ee.Dictionary({ VALID_AREA_PERCENTAGE: area_perc});
+  return image.set(dict);
+}
+
+
+// Landsat Missions visualization Parameters
+var visParMSS_1to3_NIR = {bands: ['B6', 'B5', 'B4']};
+var visParMSS_TOA_2_NIR = {min: 0.0,max: 0.4,gamma: 1.2,bands: ['B6', 'B5', 'B4']};
+var visParMSS_4to5_NIR = {bands: ['B3', 'B2', 'B1']};
+var visParMSS_TOA_4to5_NIR = {min: 0.0,max: 0.4,gamma: 1.2,bands: ['B3', 'B2', 'B1']};
+var visParTM_4to5_RGB = {bands: ['B3', 'B2', 'B1']};
+var visParTM_TOA_4to5_RGB = {min: 0.0,max: 0.4,gamma: 1.2,bands: ['B3', 'B2', 'B1']};
+var visParTM_lvl2_4to7_RGB = {min: 0.0,max: 0.3,bands: ['SR_B3', 'SR_B2', 'SR_B1']};
+var visParOLI_TIRS_lvl2_8to9_RGB = {min: 0.0,max: 0.3,bands: ['SR_B4', 'SR_B3', 'SR_B2']};
+
+
+// ------------------ LANDSAT MISSIONS COLLECTION FILTERING AND PRE-PROCESSING ---------------//
+
+// ------------------------------------- LANDSAT 2 MSS ---------------------------------------//
+// Collection of Raw Scenes (Values as DN)
+var L2_MSS_T2 = ee.ImageCollection('LANDSAT/LM02/C02/T2')  // Tier 2 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .sort('CLOUD_COVER_LAND');
+var L2_Rows_T2 = L2_MSS_T2.distinct(['WRS_ROW'])
+                          .aggregate_array('WRS_ROW').sort();
+var L2_Paths_T2 = L2_MSS_T2.distinct(['WRS_PATH'])
+                           .aggregate_array('WRS_PATH').sort();
+var L2_dates_T2 = L2_MSS_T2.distinct(['DATE_ACQUIRED'])
+                           .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 2 MSS Tier 2:',L2_MSS_T2,'Paths:',L2_Paths_T2,'Rows:',L2_Rows_T2, 
+      'Dates:', L2_dates_T2);
+//Map.addLayer(L2_MSS_T2, visParMSS_1to3_NIR, 'Landsat 2 MSS T2 Raw NIR(B6,B5,B4)',0);
+// Conversion from DN to TOA Reflectance from Scene Metadata
+var L2_MSS_T2 = L2_MSS_T2.map(TOA_from_Metada_L2);
+Map.addLayer(L2_MSS_T2, visParMSS_TOA_2_NIR, 'Landsat 2 MSS T2 TOA NIR',0);
+//Masking clouds According to User defined parameters
+var L2_MSS_T2_Msk = L2_MSS_T2.map(function(image){
+                      var mask = Get_Cloud_Mask_MSS_L2(image);
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L2_MSS_T2_Msk, visParMSS_TOA_2_NIR, 
+             'Landsat 2 MSS T2 TOA Masked NIR',0,0.3);
+// Cropping images to AOI
+var L2_MSS_T2_Msk_AOI = L2_MSS_T2_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L2_MSS_T2 = L2_MSS_T2_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_MSS_L2(image);
+                      var ValidArea = Get_Valid_px_Area_MSS(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L2_MSS_T2 = Valid_px_Area_L2_MSS_T2.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L2_MSS_T2 Collection:', Valid_px_Area_L2_MSS_T2);
+// Filtering on defined valid area percentage
+var L2_MSS_T2_Final = Valid_px_Area_L2_MSS_T2
+                  .filter(ee.Filter.gt('VALID_AREA_PERCENTAGE', min_validA_L2))
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L2_MSS_T2_Final Collection Sorted:', L2_MSS_T2_Final);
+Map.addLayer(L2_MSS_T2_Final.first(), visParMSS_TOA_2_NIR, 
+             'Landsat 2 MSS T2 Final First NIR',1);
+
+var L2_MSS_T1 = ee.ImageCollection('LANDSAT/LM02/C02/T1')  // Tier 1 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .sort('CLOUD_COVER_LAND');
+var L2_Rows_T1 = L2_MSS_T1.distinct(['WRS_ROW'])
+                          .aggregate_array('WRS_ROW').sort();
+var L2_Paths_T1 = L2_MSS_T1.distinct(['WRS_PATH'])
+                           .aggregate_array('WRS_PATH').sort();
+var L2_dates_T1 = L2_MSS_T1.distinct(['DATE_ACQUIRED'])
+                           .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 2 MSS Tier 1:',L2_MSS_T1,'Paths:',L2_Paths_T1,'Rows:',L2_Rows_T1, 
+      'Dates:', L2_dates_T1);
+//Map.addLayer(L2_MSS_T1, visParMSS_1to3_NIR, 'Landsat 2 MSS T1 Raw NIR(B6,B5,B4)',0);
+// Conversion from DN to TOA Reflectance from Scene Metadata
+var L2_MSS_T1 = L2_MSS_T1.map(TOA_from_Metada_L2);
+Map.addLayer(L2_MSS_T1, visParMSS_TOA_2_NIR, 'Landsat 2 MSS T1 TOA NIR',0);
+//Masking clouds According to User defined parameters
+var L2_MSS_T1_Msk = L2_MSS_T1.map(function(image){
+                      var mask = Get_Cloud_Mask_MSS_L2(image);
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L2_MSS_T1_Msk, visParMSS_TOA_2_NIR, 
+             'Landsat 2 MSS T1 TOA Masked NIR',0,0.3);
+// Cropping images to AOI
+var L2_MSS_T1_Msk_AOI = L2_MSS_T1_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L2_MSS_T1 = L2_MSS_T1_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_MSS_L2(image);
+                      var ValidArea = Get_Valid_px_Area_MSS(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L2_MSS_T1 = Valid_px_Area_L2_MSS_T1.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L2_MSS_T1 Collection:', Valid_px_Area_L2_MSS_T1);
+// Filtering on defined valid area percentage
+var L2_MSS_T1_Final = Valid_px_Area_L2_MSS_T1
+                  .filter(ee.Filter.gt('VALID_AREA_PERCENTAGE', min_validA_L2))
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L2_MSS_T1_Final Collection Sorted:', L2_MSS_T1_Final);
+Map.addLayer(L2_MSS_T1_Final, visParMSS_TOA_2_NIR, //.first()
+             'Landsat 2 MSS T1 Final First NIR',1);
+
+
+// ----------------------------------- LANDSAT 4 MSS ---------------------------------------//
+var L4_MSS_T2 = ee.ImageCollection('LANDSAT/LM04/C02/T2') // Tier 2 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .sort('CLOUD_COVER_LAND');
+var L4_MSS_Rows_T2 = L4_MSS_T2.distinct(['WRS_ROW'])
+                              .aggregate_array('WRS_ROW').sort();
+var L4_MSS_Paths_T2 = L4_MSS_T2.distinct(['WRS_PATH'])
+                               .aggregate_array('WRS_PATH').sort();
+var L4_MSS_dates_T2 = L4_MSS_T2.distinct(['DATE_ACQUIRED'])
+                               .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 4 MSS Tier 2:',L4_MSS_T2,'Paths:',L4_MSS_Paths_T2,'Rows:',L4_MSS_Rows_T2, 
+      'Dates:', L4_MSS_dates_T2);
+//Map.addLayer(L4_MSS_T2, visParMSS_4to5_NIR, 'Landsat 4 MSS T2 NIR(B3,B2,B1)',0);
+// Conversion from DN to TOA Reflectance from Scene Metadata
+var L4_MSS_T2 = L4_MSS_T2.map(TOA_from_Metada_L4_L5);
+Map.addLayer(L4_MSS_T2, visParMSS_TOA_4to5_NIR, 'Landsat 4 MSS T2 TOA NIR',0);
+//Masking clouds According to User defined parameters
+var L4_MSS_T2_Msk = L4_MSS_T2.map(function(image){
+                      var mask = Get_Cloud_Mask_MSS_L4(image);
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L4_MSS_T2_Msk, visParMSS_TOA_4to5_NIR, 
+             'Landsat 4 MSS T2 TOA Masked NIR',0,0.3);
+// Cropping images to AOI
+var L4_MSS_T2_Msk_AOI = L4_MSS_T2_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L4_MSS_T2 = L4_MSS_T2_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_MSS_L4(image);
+                      var ValidArea = Get_Valid_px_Area_MSS(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L4_MSS_T2 = Valid_px_Area_L4_MSS_T2.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L4_MSS_T2 Collection:', Valid_px_Area_L4_MSS_T2);
+// Filtering on defined valid area percentage
+var L4_MSS_T2_Final = Valid_px_Area_L4_MSS_T2
+                  .filter(ee.Filter.gt('VALID_AREA_PERCENTAGE', min_validA_L4))
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L4_MSS_T2_Final Collection Sorted:', L4_MSS_T2_Final);
+Map.addLayer(L4_MSS_T2_Final.first(), visParMSS_TOA_4to5_NIR,
+             'Landsat 4 MSS T2 Final First NIR',1);
+
+var L4_MSS_T1 = ee.ImageCollection('LANDSAT/LM04/C02/T1') // Tier 1 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .sort('CLOUD_COVER_LAND');
+var L4_MSS_Rows_T1 = L4_MSS_T1.distinct(['WRS_ROW'])
+                              .aggregate_array('WRS_ROW').sort();
+var L4_MSS_Paths_T1 = L4_MSS_T1.distinct(['WRS_PATH'])
+                               .aggregate_array('WRS_PATH').sort();
+var L4_MSS_dates_T1 = L4_MSS_T1.distinct(['DATE_ACQUIRED'])
+                               .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 4 MSS Tier 1:',L4_MSS_T1,'Paths:',L4_MSS_Paths_T1,'Rows:',L4_MSS_Rows_T1, 
+      'Dates:', L4_MSS_dates_T1);
+//Map.addLayer(L4_MSS_T1, visParMSS_4to5_NIR, 'Landsat 4 MSS T1 NIR(B3,B2,B1)',0);
+// Conversion from DN to TOA Reflectance from Scene Metadata
+var L4_MSS_T1 = L4_MSS_T1.map(TOA_from_Metada_L4_L5);
+Map.addLayer(L4_MSS_T1, visParMSS_TOA_4to5_NIR, 'Landsat 4 MSS T1 TOA NIR',0);
+//Masking clouds According to User defined parameters
+var L4_MSS_T1_Msk = L4_MSS_T1.map(function(image){
+                      var mask = Get_Cloud_Mask_MSS_L4(image);
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L4_MSS_T1_Msk, visParMSS_TOA_4to5_NIR, 
+             'Landsat 4 MSS T1 TOA Masked NIR',0,0.3);
+// Cropping images to AOI
+var L4_MSS_T1_Msk_AOI = L4_MSS_T1_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L4_MSS_T1 = L4_MSS_T1_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_MSS_L4(image);
+                      var ValidArea = Get_Valid_px_Area_MSS(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L4_MSS_T1 = Valid_px_Area_L4_MSS_T1.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L4_MSS_T2 Collection:', Valid_px_Area_L4_MSS_T1);
+// Filtering on defined valid area percentage
+var L4_MSS_T1_Final = Valid_px_Area_L4_MSS_T1
+                  .filter(ee.Filter.gt('VALID_AREA_PERCENTAGE', min_validA_L4))
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L4_MSS_T1_Final Collection Sorted:', L4_MSS_T1_Final);
+Map.addLayer(L4_MSS_T1_Final, visParMSS_TOA_4to5_NIR, //.first()
+             'Landsat 4 MSS T1 Final First NIR',1);
+
+
+// ------------------------------------ LANDSAT 5 MSS ----------------------------------------//
+var L5_MSS_T2 = ee.ImageCollection('LANDSAT/LM05/C02/T2') // Tier 2 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .sort('CLOUD_COVER_LAND');
+var L5_MSS_Rows_T2 = L5_MSS_T2.distinct(['WRS_ROW'])
+                              .aggregate_array('WRS_ROW').sort();
+var L5_MSS_Paths_T2 = L5_MSS_T2.distinct(['WRS_PATH'])
+                               .aggregate_array('WRS_PATH').sort();
+var L5_MSS_dates_T2 = L5_MSS_T2.distinct(['DATE_ACQUIRED'])
+                               .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 5 MSS Tier 2:',L5_MSS_T2,'Paths:',L5_MSS_Paths_T2,'Rows:',L5_MSS_Rows_T2, 
+      'Dates:', L5_MSS_dates_T2);
+//Map.addLayer(L5_MSS_T2, visParMSS_4to5_NIR, 'Landsat 5 T2 MSS NIR(B3,B2,B1)',0);
+// Conversion from DN to TOA Reflectance from Scene Metadata
+var L5_MSS_T2 = L5_MSS_T2.map(TOA_from_Metada_L4_L5);
+Map.addLayer(L5_MSS_T2, visParMSS_TOA_4to5_NIR, 'Landsat 5 MSS T2 TOA NIR',0);
+//Masking clouds According to User defined parameters
+var L5_MSS_T2_Msk = L5_MSS_T2.map(function(image){
+                      var mask = Get_Cloud_Mask_MSS_L5(image);
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L5_MSS_T2_Msk, visParMSS_TOA_4to5_NIR, 
+             'Landsat 5 MSS T2 TOA Masked NIR',0,0.3);
+// Cropping images to AOI
+var L5_MSS_T2_Msk_AOI = L5_MSS_T2_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L5_MSS_T2 = L5_MSS_T2_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_MSS_L5(image);
+                      var ValidArea = Get_Valid_px_Area_MSS(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L5_MSS_T2 = Valid_px_Area_L5_MSS_T2.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L5_MSS_T2 Collection:', Valid_px_Area_L5_MSS_T2);
+// Filtering on defined valid area percentage
+var L5_MSS_T2_Final = Valid_px_Area_L5_MSS_T2
+                  .filter(ee.Filter.gt('VALID_AREA_PERCENTAGE', min_validA_L5))
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L5_MSS_T2_Final Collection Sorted:', L5_MSS_T2_Final);
+Map.addLayer(L5_MSS_T2_Final.first(), visParMSS_TOA_4to5_NIR,
+             'Landsat 5 MSS T2 Final First NIR',1);
+
+var L5_MSS_T1 = ee.ImageCollection('LANDSAT/LM05/C02/T1') // Tier 1 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .sort('CLOUD_COVER_LAND');
+var L5_MSS_Rows_T1 = L5_MSS_T1.distinct(['WRS_ROW'])
+                              .aggregate_array('WRS_ROW').sort();
+var L5_MSS_Paths_T1 = L5_MSS_T1.distinct(['WRS_PATH'])
+                               .aggregate_array('WRS_PATH').sort();
+var L5_MSS_dates_T1 = L5_MSS_T1.distinct(['DATE_ACQUIRED'])
+                               .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 5 MSS Tier 1:',L5_MSS_T1,'Paths:',L5_MSS_Paths_T1,'Rows:',L5_MSS_Rows_T1, 
+      'Dates:', L5_MSS_dates_T1);
+// Conversion from DN to TOA Reflectance from Scene Metadata
+var L5_MSS_T1 = L5_MSS_T1.map(TOA_from_Metada_L4_L5);
+Map.addLayer(L5_MSS_T1, visParMSS_TOA_4to5_NIR, 'Landsat 5 MSS T1 TOA NIR',0);
+//Masking clouds According to User defined parameters
+var L5_MSS_T1_Msk = L5_MSS_T1.map(function(image){
+                      var mask = Get_Cloud_Mask_MSS_L5(image);
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L5_MSS_T1_Msk, visParMSS_TOA_4to5_NIR, 
+             'Landsat 5 MSS T1 TOA Masked NIR',0,0.3);
+// Cropping images to AOI
+var L5_MSS_T1_Msk_AOI = L5_MSS_T1_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L5_MSS_T1 = L5_MSS_T1_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_MSS_L5(image);
+                      var ValidArea = Get_Valid_px_Area_MSS(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L5_MSS_T1 = Valid_px_Area_L5_MSS_T1.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L5_MSS_T1 Collection:', Valid_px_Area_L5_MSS_T1);
+// Filtering on defined valid area percentage
+var L5_MSS_T1_Final = Valid_px_Area_L5_MSS_T1
+                  .filter(ee.Filter.gt('VALID_AREA_PERCENTAGE', min_validA_L5))
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L5_MSS_T1_Final Collection Sorted:', L5_MSS_T1_Final);
+Map.addLayer(L5_MSS_T1_Final, visParMSS_TOA_4to5_NIR, //.first()
+             'Landsat 5 MSS T1 Final First NIR',1);
+
+
+// --------------------------------- LANDSAT 4 TM Level 2 ----------------------------------//
+
+var L4_TM_lvl2_T2 = ee.ImageCollection('LANDSAT/LT04/C02/T2_L2') // Tier 2 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .map(applyScaleFactors)
+                  .sort('CLOUD_COVER_LAND');
+var L4_TM_Rows_T2 = L4_TM_lvl2_T2.distinct(['WRS_ROW'])
+                                 .aggregate_array('WRS_ROW').sort();
+var L4_TM_Paths_T2 = L4_TM_lvl2_T2.distinct(['WRS_PATH'])
+                                  .aggregate_array('WRS_PATH').sort();
+var L4_TM_dates_T2 = L4_TM_lvl2_T2.distinct(['DATE_ACQUIRED'])
+                                  .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 4 TM Level 2 Tier 2:',L4_TM_lvl2_T2,'Paths:',L4_TM_Paths_T2,
+      'Rows:',L4_TM_Rows_T2,'Dates:', L4_TM_dates_T2);
+Map.addLayer(L4_TM_lvl2_T2, visParTM_lvl2_4to7_RGB, 
+             'Landsat 4 TM Level2 T2 RGB',0);
+//Masking clouds According to QA_PIXEL Band
+var L4_TM_lvl2_T2_Msk = L4_TM_lvl2_T2.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L4_TM_lvl2_T2_Msk, visParTM_lvl2_4to7_RGB, 
+             'Landsat 4 TM Level2 T2 Msk RGB',0,0.3);
+// Cropping images to AOI
+var L4_TM_lvl2_T2_Msk_AOI = L4_TM_lvl2_T2_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L4_TM_lvl2_T2 = L4_TM_lvl2_T2_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      var ValidArea = Get_Valid_px_Area(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L4_TM_lvl2_T2 = Valid_px_Area_L4_TM_lvl2_T2.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L4_TM_lvl2_T2 Collection:', Valid_px_Area_L4_TM_lvl2_T2);
+// Filtering on defined valid area percentage
+var L4_TM_lvl2_T2_Final = Valid_px_Area_L4_TM_lvl2_T2
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L4_TM_lvl2_T2_Final Collection Sorted:', L4_TM_lvl2_T2_Final);
+Map.addLayer(L4_TM_lvl2_T2_Final, visParTM_lvl2_4to7_RGB, //.first()
+             'Landsat 4 MSS T2 Final First RGB',1);
+
+
+var L4_TM_lvl2_T1 = ee.ImageCollection('LANDSAT/LT04/C02/T1_L2') // Tier 1 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .map(applyScaleFactors)
+                  .sort('CLOUD_COVER_LAND');
+var L4_TM_Rows_T1 = L4_TM_lvl2_T1.distinct(['WRS_ROW'])
+                                 .aggregate_array('WRS_ROW').sort();
+var L4_TM_Paths_T1 = L4_TM_lvl2_T1.distinct(['WRS_PATH'])
+                                  .aggregate_array('WRS_PATH').sort();
+var L4_TM_dates_T1 = L4_TM_lvl2_T1.distinct(['DATE_ACQUIRED'])
+                                  .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 4 TM Level 2 Tier 1:',L4_TM_lvl2_T1,'Paths:',L4_TM_Paths_T1,
+      'Rows:',L4_TM_Rows_T1,'Dates:', L4_TM_dates_T1);
+Map.addLayer(L4_TM_lvl2_T1, visParTM_lvl2_4to7_RGB, 
+             'Landsat 4 TM Level2 T1 RGB',0);
+//Masking clouds According to QA_PIXEL Band
+var L4_TM_lvl2_T1_Msk = L4_TM_lvl2_T1.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L4_TM_lvl2_T1_Msk, visParTM_lvl2_4to7_RGB, 
+             'Landsat 4 TM Level2 T1 Masked RGB',0,0.3);
+// Cropping images to AOI
+var L4_TM_lvl2_T1_Msk_AOI = L4_TM_lvl2_T1_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L4_TM_lvl2_T1 = L4_TM_lvl2_T1_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      var ValidArea = Get_Valid_px_Area(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L4_TM_lvl2_T1 = Valid_px_Area_L4_TM_lvl2_T1.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L4_TM_lvl2_T1 Collection:', Valid_px_Area_L4_TM_lvl2_T1);
+// Filtering on defined valid area percentage
+var L4_TM_lvl2_T1_Final = Valid_px_Area_L4_TM_lvl2_T1
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L4_TM_lvl2_T1_Final Collection Sorted:', L4_TM_lvl2_T1_Final);
+Map.addLayer(L4_TM_lvl2_T1_Final.first(), visParTM_lvl2_4to7_RGB,
+             'Landsat 4 TM T1 Final First RGB',1);
+
+
+// -------------------------------- LANDSAT 5 TM Level 2 -------------------------------------//
+
+var L5_TM_lvl2_T2 = ee.ImageCollection('LANDSAT/LT05/C02/T2_L2') // Tier 2 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .sort('CLOUD_COVER_LAND')
+                  .map(applyScaleFactors);
+var L5_TM_Rows_T2 = L5_TM_lvl2_T2.distinct(['WRS_ROW'])
+                                 .aggregate_array('WRS_ROW').sort();
+var L5_TM_Paths_T2 = L5_TM_lvl2_T2.distinct(['WRS_PATH'])
+                                  .aggregate_array('WRS_PATH').sort();
+var L5_TM_dates_T2 = L5_TM_lvl2_T2.distinct(['DATE_ACQUIRED'])
+                                  .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 5 TM Level 2 Tier 2:', L5_TM_lvl2_T2,'Paths:',L5_TM_Paths_T2,
+      'Rows:',L5_TM_Rows_T2, 'Dates:', L5_TM_dates_T2);
+Map.addLayer(L5_TM_lvl2_T2, visParTM_lvl2_4to7_RGB, 
+             'Landsat 5 T2 TM Level2 RGB',0);
+//Masking clouds According to QA_PIXEL Band
+var L5_TM_lvl2_T2_Msk = L5_TM_lvl2_T2.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L5_TM_lvl2_T2_Msk, visParTM_lvl2_4to7_RGB, 
+             'Landsat 5 TM Level2 T2 Masked RGB',0,0.3);
+// Cropping images to AOI
+var L5_TM_lvl2_T2_Msk_AOI = L5_TM_lvl2_T2_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L5_TM_lvl2_T2 = L5_TM_lvl2_T2_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      var ValidArea = Get_Valid_px_Area(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L5_TM_lvl2_T2 = Valid_px_Area_L5_TM_lvl2_T2.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L5_TM_lvl2_T2 Collection:', Valid_px_Area_L5_TM_lvl2_T2);
+// Filtering on defined valid area percentage
+var L5_TM_lvl2_T2_Final = Valid_px_Area_L5_TM_lvl2_T2
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L5_TM_lvl2_T2_Final Collection Sorted:', L5_TM_lvl2_T2_Final);
+Map.addLayer(L5_TM_lvl2_T2_Final.first(), visParTM_lvl2_4to7_RGB,
+             'Landsat 5 TM T2 Final First RGB',1);
+
+var L5_TM_lvl2_T1 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2') // Tier 1 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .sort('CLOUD_COVER_LAND')
+                  .map(applyScaleFactors);
+var L5_TM_Rows_T1 = L5_TM_lvl2_T1.distinct(['WRS_ROW'])
+                                 .aggregate_array('WRS_ROW').sort();
+var L5_TM_Paths_T1 = L5_TM_lvl2_T1.distinct(['WRS_PATH'])
+                                  .aggregate_array('WRS_PATH').sort();
+var L5_TM_dates_T1 = L5_TM_lvl2_T1.distinct(['DATE_ACQUIRED'])
+                                  .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 5 TM Level 2 Tier 1:', L5_TM_lvl2_T1,'Paths:',L5_TM_Paths_T1,
+      'Rows:',L5_TM_Rows_T1, 'Dates:', L5_TM_dates_T1);
+Map.addLayer(L5_TM_lvl2_T1, visParTM_lvl2_4to7_RGB, 
+             'Landsat 5 T1 TM Level2 RGB',0);
+//Masking clouds According to QA_PIXEL Band
+var L5_TM_lvl2_T1_Msk = L5_TM_lvl2_T1.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L5_TM_lvl2_T1_Msk, visParTM_lvl2_4to7_RGB, 
+             'Landsat 5 TM Level2 T1 Masked RGB',0,0.3);
+// Cropping images to AOI
+var L5_TM_lvl2_T1_Msk_AOI = L5_TM_lvl2_T1_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L5_TM_lvl2_T1 = L5_TM_lvl2_T1_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      var ValidArea = Get_Valid_px_Area(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L5_TM_lvl2_T1 = Valid_px_Area_L5_TM_lvl2_T1.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L5_TM_lvl2_T1 Collection:', Valid_px_Area_L5_TM_lvl2_T1);
+// Filtering on defined valid area percentage
+var L5_TM_lvl2_T1_Final = Valid_px_Area_L5_TM_lvl2_T1
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L5_TM_lvl2_T1_Final Collection Sorted:', L5_TM_lvl2_T1_Final);
+Map.addLayer(L5_TM_lvl2_T1_Final.first(), visParTM_lvl2_4to7_RGB,
+             'Landsat 5 TM T1 Final First RGB',1);
+
+// ---------------------------------- LANDSAT 7 TM Level 2 -----------------------------------//
+var L7_lvl2_T2 = ee.ImageCollection("LANDSAT/LE07/C02/T2_L2") // Tier 2 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .sort('CLOUD_COVER_LAND')
+                  .map(applyScaleFactors);
+var L7_Rows_T2 = L7_lvl2_T2.distinct(['WRS_ROW'])
+                        .aggregate_array('WRS_ROW').sort();
+var L7_Paths_T2 = L7_lvl2_T2.distinct(['WRS_PATH'])
+                         .aggregate_array('WRS_PATH').sort();
+var L7_dates_T2 = L7_lvl2_T2.distinct(['DATE_ACQUIRED'])
+                         .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 7 ETM+ Level 2 Tier 2:',L7_lvl2_T2,'Paths:',L7_Paths_T2,
+      'Rows:',L7_Rows_T2, 'Dates:', L7_dates_T2);
+Map.addLayer(L7_lvl2_T2, visParTM_lvl2_4to7_RGB, 
+             'Landsat 7 ETM+ Level2 T2 RGB',0);
+//Masking clouds According to QA_PIXEL Band
+var L7_lvl2_T2_Msk = L7_lvl2_T2.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L7_lvl2_T2_Msk, visParTM_lvl2_4to7_RGB, 
+             'Landsat 7 ETM+ Level2 T2 Masked RGB',0,0.3);
+// Cropping images to AOI
+var L7_lvl2_T2_Msk_AOI = L7_lvl2_T2_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L7_lvl2_T2 = L7_lvl2_T2_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      var ValidArea = Get_Valid_px_Area(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L7_lvl2_T2 = Valid_px_Area_L7_lvl2_T2.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L7_lvl2_T2 Collection:', Valid_px_Area_L7_lvl2_T2);
+// Filtering on defined valid area percentage
+var L7_lvl2_T2_Final = Valid_px_Area_L7_lvl2_T2
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L7_lvl2_T2_Final Collection Sorted:', L7_lvl2_T2_Final);
+Map.addLayer(L7_lvl2_T2_Final.first(), visParTM_lvl2_4to7_RGB,
+             'Landsat 7 ETM+ T2 Final First RGB',1);
+
+var L7_lvl2_T1 = ee.ImageCollection("LANDSAT/LE07/C02/T1_L2") // Tier 1 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .sort('CLOUD_COVER_LAND')
+                  .map(applyScaleFactors);
+var L7_Rows_T1 = L7_lvl2_T1.distinct(['WRS_ROW'])
+                        .aggregate_array('WRS_ROW').sort();
+var L7_Paths_T1 = L7_lvl2_T1.distinct(['WRS_PATH'])
+                         .aggregate_array('WRS_PATH').sort();
+var L7_dates_T1 = L7_lvl2_T1.distinct(['DATE_ACQUIRED'])
+                         .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 7 ETM+ Level 2 Tier 1:',L7_lvl2_T1,'Paths:',L7_Paths_T1,
+      'Rows:',L7_Rows_T1, 'Dates:', L7_dates_T1);
+
+Map.addLayer(L7_lvl2_T1, visParTM_lvl2_4to7_RGB, 
+             'Landsat 7 ETM+ Level2 T1 RGB',0);
+//Masking clouds According to QA_PIXEL Band
+var L7_lvl2_T1_Msk = L7_lvl2_T1.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L7_lvl2_T1_Msk, visParTM_lvl2_4to7_RGB, 
+             'Landsat 7 ETM+ Level2 T1 Masked RGB',0,0.3);
+// Cropping images to AOI
+var L7_lvl2_T1_Msk_AOI = L7_lvl2_T1_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L7_lvl2_T1 = L7_lvl2_T1_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      var ValidArea = Get_Valid_px_Area(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L7_lvl2_T1 = Valid_px_Area_L7_lvl2_T1.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L7_lvl2_T1 Collection:', Valid_px_Area_L7_lvl2_T1);
+// Filtering on defined valid area percentage
+var L7_lvl2_T1_Final = Valid_px_Area_L7_lvl2_T1
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L7_lvl2_T1_Final Collection Sorted:', L7_lvl2_T1_Final);
+Map.addLayer(L7_lvl2_T1_Final.first(), visParTM_lvl2_4to7_RGB,
+             'Landsat 7 ETM+ T1 Final First RGB',1);
+
+// ------------------------------- LANDSAT 8 OLI+TIRS Level 2 --------------------------------//
+var L8_lvl2_T2 = ee.ImageCollection("LANDSAT/LC08/C02/T2_L2") // Tier 2 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .sort('CLOUD_COVER_LAND')
+                  .map(applyScaleFactors_new);
+var L8_Rows_T2 = L8_lvl2_T2.distinct(['WRS_ROW'])
+                        .aggregate_array('WRS_ROW').sort();
+var L8_Paths_T2 = L8_lvl2_T2.distinct(['WRS_PATH'])
+                         .aggregate_array('WRS_PATH').sort();
+var L8_dates_T2 = L8_lvl2_T2.distinct(['DATE_ACQUIRED'])
+                         .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 8 OLI-TIRS Level 2 Tier 2:',L8_lvl2_T2,'Paths:',L8_Paths_T2,
+      'Rows:',L8_Rows_T2, 'Dates:', L8_dates_T2);
+Map.addLayer(L8_lvl2_T2, visParOLI_TIRS_lvl2_8to9_RGB, 
+             'Landsat 8 T2 OLI+TIRS Level2 RGB',0);
+//Masking clouds According to QA_PIXEL Band
+var L8_lvl2_T2_Msk = L8_lvl2_T2.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L8_lvl2_T2_Msk, visParOLI_TIRS_lvl2_8to9_RGB, 
+             'Landsat 8 OLI-TIRS Level2 T2 Masked RGB',0,0.3);
+// Cropping images to AOI
+var L8_lvl2_T2_Msk_AOI = L8_lvl2_T2_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L8_lvl2_T2 = L8_lvl2_T2_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      var ValidArea = Get_Valid_px_Area(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L8_lvl2_T2 = Valid_px_Area_L8_lvl2_T2.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L8_lvl2_T2 Collection:', Valid_px_Area_L8_lvl2_T2);
+// Filtering on defined valid area percentage
+var L8_lvl2_T2_Final = Valid_px_Area_L8_lvl2_T2
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L8_lvl2_T2_Final Collection Sorted:', L8_lvl2_T2_Final);
+Map.addLayer(L8_lvl2_T2_Final.first(), visParOLI_TIRS_lvl2_8to9_RGB,
+             'Landsat 8 OLI-TIRS T2 Final First RGB',1);
+
+var L8_lvl2_T1 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2") // Tier 1 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .sort('CLOUD_COVER_LAND')
+                  .map(applyScaleFactors_new);
+var L8_Rows_T1 = L8_lvl2_T1.distinct(['WRS_ROW'])
+                        .aggregate_array('WRS_ROW').sort();
+var L8_Paths_T1 = L8_lvl2_T1.distinct(['WRS_PATH'])
+                         .aggregate_array('WRS_PATH').sort();
+var L8_dates_T1 = L8_lvl2_T1.distinct(['DATE_ACQUIRED'])
+                         .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 8 OLI+TIRS Level 2 Tier 1:',L8_lvl2_T1,'Paths:',L8_Paths_T1,
+      'Rows:',L8_Rows_T1, 'Dates:', L8_dates_T1);
+Map.addLayer(L8_lvl2_T1, visParOLI_TIRS_lvl2_8to9_RGB, 
+             'Landsat 8 T1 OLI+TIRS Level2 RGB',0);
+//Masking clouds According to QA_PIXEL Band
+var L8_lvl2_T1_Msk = L8_lvl2_T1.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L8_lvl2_T1_Msk, visParOLI_TIRS_lvl2_8to9_RGB, 
+             'Landsat 8 OLI-TIRS Level2 T1 Masked RGB',0,0.3);
+// Cropping images to AOI
+var L8_lvl2_T1_Msk_AOI = L8_lvl2_T1_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L8_lvl2_T1 = L8_lvl2_T1_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      var ValidArea = Get_Valid_px_Area(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L8_lvl2_T1 = Valid_px_Area_L8_lvl2_T1.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L8_lvl2_T1 Collection:', Valid_px_Area_L8_lvl2_T1);
+// Filtering on defined valid area percentage
+var L8_lvl2_T1_Final = Valid_px_Area_L8_lvl2_T1
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L8_lvl2_T1_Final Collection Sorted:', L8_lvl2_T1_Final);
+Map.addLayer(L8_lvl2_T1_Final.first(), visParOLI_TIRS_lvl2_8to9_RGB,
+             'Landsat 8 OLI-TIRS T1 Final First RGB',1);
+
+
+// ------------------------------- LANDSAT 9 OLI+TIRS Level 2 --------------------------------//
+var L9_lvl2_T2 = ee.ImageCollection("LANDSAT/LC09/C02/T2_L2") // Tier 2 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .sort('CLOUD_COVER_LAND')
+                  .map(applyScaleFactors_new);
+var L9_Rows_T2 = L9_lvl2_T2.distinct(['WRS_ROW'])
+                        .aggregate_array('WRS_ROW').sort();
+var L9_Paths_T2 = L9_lvl2_T2.distinct(['WRS_PATH'])
+                         .aggregate_array('WRS_PATH').sort();
+var L9_dates_T2 = L9_lvl2_T2.distinct(['DATE_ACQUIRED'])
+                         .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 9 OLI+TIRS Level 2 Tier 2:',L9_lvl2_T2,'Paths:',L9_Paths_T2,
+      'Rows:',L9_Rows_T2, 'Dates:', L9_dates_T2);
+Map.addLayer(L9_lvl2_T2, visParOLI_TIRS_lvl2_8to9_RGB, 
+             'Landsat 9 OLI+TIRS Level2 T2 RGB',0);
+//Masking clouds According to QA_PIXEL Band
+var L9_lvl2_T2_Msk = L9_lvl2_T2.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L9_lvl2_T2_Msk, visParOLI_TIRS_lvl2_8to9_RGB, 
+             'Landsat 9 OLI-TIRS Level2 T2 Masked RGB',0,0.3);
+// Cropping images to AOI
+var L9_lvl2_T2_Msk_AOI = L9_lvl2_T2_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L9_lvl2_T2 = L9_lvl2_T2_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      var ValidArea = Get_Valid_px_Area(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L9_lvl2_T2 = Valid_px_Area_L9_lvl2_T2.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L9_lvl2_T2 Collection:', Valid_px_Area_L9_lvl2_T2);
+// Filtering on defined valid area percentage
+var L9_lvl2_T2_Final = Valid_px_Area_L9_lvl2_T2
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L9_lvl2_T2_Final Collection Sorted:', L9_lvl2_T2_Final);
+Map.addLayer(L9_lvl2_T2_Final, visParOLI_TIRS_lvl2_8to9_RGB, //.first()
+             'Landsat 9 OLI-TIRS T2 Final First RGB',1);
+
+var L9_lvl2_T1 = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2") // Tier 1 Collection
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUD_COVER_LAND', max_CloudCover))
+                  .filterDate(Date_from, Date_to)
+                  .sort('CLOUD_COVER_LAND')
+                  .map(applyScaleFactors_new);
+var L9_Rows_T1 = L9_lvl2_T1.distinct(['WRS_ROW'])
+                        .aggregate_array('WRS_ROW').sort();
+var L9_Paths_T1 = L9_lvl2_T1.distinct(['WRS_PATH'])
+                         .aggregate_array('WRS_PATH').sort();
+var L9_dates_T1 = L9_lvl2_T1.distinct(['DATE_ACQUIRED'])
+                         .aggregate_array('DATE_ACQUIRED').sort();
+print('LANDSAT 9 OLI+TIRS Level 2 Tier 1:',L9_lvl2_T1,'Paths:',L9_Paths_T1,
+      'Rows:',L9_Rows_T1, 'Dates:', L9_dates_T1);
+Map.addLayer(L9_lvl2_T1, visParOLI_TIRS_lvl2_8to9_RGB, 
+             'Landsat 9 OLI+TIRS Level2 T1 RGB',0);
+//Masking clouds According to QA_PIXEL Band
+var L9_lvl2_T1_Msk = L9_lvl2_T1.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      return image.updateMask(mask);
+                    });
+Map.addLayer(L9_lvl2_T1_Msk, visParOLI_TIRS_lvl2_8to9_RGB, 
+             'Landsat 9 OLI-TIRS Level2 T1 Masked RGB',0,0.3);
+// Cropping images to AOI
+var L9_lvl2_T1_Msk_AOI = L9_lvl2_T1_Msk.map(function(image){
+                      return image.clip(AOI);
+                    });
+// Adding The valid Area as a Property
+var Valid_px_Area_L9_lvl2_T1 = L9_lvl2_T1_Msk_AOI.map(function(image){
+                      var mask = Get_Cloud_Mask_QA(image).not();
+                      var ValidArea = Get_Valid_px_Area(image, mask);
+                      return ValidArea;
+                    });
+// Adding The valid Area Percentage as a Property
+var Valid_px_Area_L9_lvl2_T1 = Valid_px_Area_L9_lvl2_T1.map(function(image){
+                      var area_perc = Get_Valid_px_Area_Perc(image);
+                      return area_perc;
+                    });
+print('L9_lvl2_T1 Collection:', Valid_px_Area_L9_lvl2_T1);
+// Filtering on defined valid area percentage
+var L9_lvl2_T1_Final = Valid_px_Area_L9_lvl2_T1
+                  .sort('VALID_AREA_PERCENTAGE', false); //sort in descending order
+print('L9_lvl2_T1_Final Collection Sorted:', L9_lvl2_T1_Final);
+Map.addLayer(L9_lvl2_T1_Final.first(), visParOLI_TIRS_lvl2_8to9_RGB,
+             'Landsat 9 OLI-TIRS T1 Final First RGB',1);
+
+// -------------------------- Animation Data Visualization ---------------------------------//
+// Create an Image Collection of the Tier 1 best images in RGB for Landsat 4 to 9
+var RGB_names = ['red','green','blue'];
+var L4_best = L4_TM_lvl2_T1_Final.first()
+                                 .select('SR_B3', 'SR_B2', 'SR_B1')
+                                 .rename(RGB_names);
+var L5_best = L5_TM_lvl2_T1_Final.first()
+                                 .select('SR_B3', 'SR_B2', 'SR_B1')
+                                 .rename(RGB_names);
+var L7_best = L7_lvl2_T1_Final.first()
+                                 .select('SR_B3', 'SR_B2', 'SR_B1')
+                                 .rename(RGB_names);
+var L8_best = L8_lvl2_T1_Final.first()
+                              .select('SR_B4','SR_B3','SR_B2')
+                              .rename(RGB_names);
+var L9_best = L9_lvl2_T1_Final.first()
+                              .select('SR_B4','SR_B3','SR_B2')
+                              .rename(RGB_names);
+var Best_Coll = ee.ImageCollection([L4_best, L5_best, L7_best, L8_best, L9_best]);
+print('Best_Coll', Best_Coll);
+var visParams = {min: 0.0,max: 0.3,bands: ['red','green','blue']};
+
+// Create RGB visualization images for use as animation frames.
+var rgbVis = Best_Coll.map(function(img) {
+  return img.visualize(visParams); //.clip(mask) Guerrero
+});
+// Transform the AOI to EPSG:3857
+var geometry = AOI.geometry();
+
+// Define GIF visualization arguments.
+var gifParams = {
+  'region': geometry,
+  'dimensions': 600,
+  //'crs': 'EPSG:3857',
+  'framesPerSecond': 1,
+  'format': 'gif'
+};
+
+// Print the GIF URL to the console.
+print(rgbVis.getVideoThumbURL(gifParams));
+
+// Render the GIF animation in the console.
+print(ui.Thumbnail(rgbVis, gifParams));
+
+Map.addLayer(ee.Image().paint(AOI, 0, 1),{},'Area of Interest (AOI)',1);
